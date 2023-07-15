@@ -1,4 +1,3 @@
-use fmt::Display;
 use std::{
     fmt,
     io::{self, Write},
@@ -29,22 +28,18 @@ impl<S> tracing_subscriber::Layer<S> for Layer
 where
     S: Subscriber + for<'span> LookupSpan<'span>,
 {
-    fn on_new_span(&self, attrs: &Attributes, id: &Id, ctx: Context<S>) {
+    fn on_new_span(&self, attrs: &Attributes<'_>, id: &Id, ctx: Context<'_, S>) {
         let span = ctx.span(id).expect("unknown span");
         let mut buf = Vec::with_capacity(256);
 
         let depth = span.parent().into_iter().flat_map(|x| x.scope()).count();
-
-        write!(buf, "s{}_name: ", depth).unwrap();
-        write_value(&mut buf, span.name());
-        put_metadata(&mut buf, span.metadata(), Some(depth));
 
         attrs.record(&mut SpanVisitor::new(&mut buf, depth));
 
         span.extensions_mut().insert(SpanFields(buf));
     }
 
-    fn on_record(&self, id: &Id, values: &Record, ctx: Context<S>) {
+    fn on_record(&self, id: &Id, values: &Record<'_>, ctx: Context<'_, S>) {
         let span = ctx.span(id).expect("unknown span");
         let depth = span.parent().into_iter().flat_map(|x| x.scope()).count();
         let mut exts = span.extensions_mut();
@@ -52,30 +47,42 @@ where
         values.record(&mut SpanVisitor::new(buf, depth));
     }
 
-    fn on_event(&self, event: &Event, ctx: Context<S>) {
+    fn on_event(&self, event: &Event<'_>, ctx: Context<'_, S>) {
         let mut writer = AndroidWriter::new(event.metadata().level(), &self.tag); //PlatformLogWriter::new(event.metadata().level(), &self.tag);
 
-        // add the target
-        let _ = write!(&mut writer, "{}: ", event.metadata().target());
+        event.record(&mut writer);
 
-        // Record span fields
+        // add the target
+        let _ = write!(&mut writer, "|> {}", event.metadata().target());
+
         let maybe_scope = ctx
             .current_span()
             .id()
             .and_then(|id| ctx.span_scope(id).map(|x| x.from_root()));
         if let Some(scope) = maybe_scope {
-            for span in scope {
+            write!(&mut writer, ": \n").unwrap();
+            for (idx, span) in scope.enumerate() {
                 let exts = span.extensions();
+                write!(&mut writer, "#{} |> ", idx).unwrap();
+                put_metadata(&mut writer, span.metadata());
                 if let Some(fields) = exts.get::<SpanFields>() {
-                    let _ = writer.write_all(&fields.0[..]);
+                    if fields.0.len() > 0 {
+                        write!(&mut writer, " {{\n").unwrap();
+                        let _ = writer.write_all(&fields.0[..]);
+                        write!(&mut writer, "}}").unwrap();
+                    } else {
+                        write!(&mut writer, " {{}}").unwrap();
+                    }
+                } else {
+                    write!(&mut writer, " {{}}").unwrap();
                 }
+                write!(&mut writer, "\n").unwrap();
             }
         }
 
         // Record event fields
         // TODO: make thius configurable
         // put_metadata(&mut writer, event.metadata(), None);
-        event.record(&mut writer);
     }
 }
 struct SpanFields(Vec<u8>);
@@ -93,8 +100,8 @@ impl<'a> SpanVisitor<'a> {
 
 impl Visit for SpanVisitor<'_> {
     fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
-        write!(self.buf, "s{}_", self.depth).unwrap();
         write_debug(&mut self.buf, field.name(), value);
+        write!(self.buf, "\n").unwrap();
     }
 }
 
@@ -102,40 +109,24 @@ impl Visit for AndroidWriter<'_> {
     fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
         if field.name() == "message" {
             // omit message field value
-            let _ = write!(self, "{:?}", value);
+            let _ = write!(self, "{:?}\n", value);
         } else {
             let _ = write_debug(self, field.name(), value);
+            let _ = write!(self, "\n");
         }
     }
 }
 
-fn put_metadata(mut buf: impl io::Write, meta: &Metadata, span: Option<usize>) {
-    write_name_with_value(&mut buf, "target", meta.target(), span);
+fn put_metadata(buf: &mut impl Write, meta: &Metadata<'_>) {
     if let Some(file) = meta.file() {
-        write_name_with_value(&mut buf, "file", file, span);
+        let _ = write!(buf, "{:?}", file);
     }
+    let _ = write!(buf, "@{}", meta.name());
     if let Some(line) = meta.line() {
-        write_name_with_value(&mut buf, "line", line, span);
+        let _ = write!(buf, "#{}", line);
     }
 }
 
-fn write_debug(mut buf: impl io::Write, name: &str, value: &dyn fmt::Debug) {
-    let _ = write!(&mut buf, "{}={:?}", name, value);
-}
-
-fn write_name_with_value<T>(mut buf: impl io::Write, name: &str, value: T, span: Option<usize>)
-where
-    T: Display,
-{
-    if let Some(n) = span {
-        let _ = write!(&mut buf, "s{}_", n);
-    }
-    let _ = write!(buf, "{}={}", name, value);
-}
-
-fn write_value<T>(mut buf: impl io::Write, value: T)
-where
-    T: Display,
-{
-    let _ = write!(&mut buf, "{}", value);
+fn write_debug(buf: &mut impl Write, name: &str, value: &dyn fmt::Debug) {
+    let _ = write!(buf, "  {}: {:?},", name, value);
 }
